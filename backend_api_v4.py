@@ -282,12 +282,14 @@ def cluster_summary(partner: Optional[str] = Query(None, description="Filter to 
 
 
 @app.get("/api/customers", response_model=List[CustomerListItem], dependencies=[Depends(require_api_key)])
-def customer_list():
-    df = query_df("""
+def customer_list(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+    partner_filter = "WHERE o.source_partner = %s" if partner else ""
+    params = (partner,) if partner else ()
+    df = query_df(f"""
         SELECT o.offtaker_id AS customer_id, o.cluster_id, o.customer_type,
                EXISTS(SELECT 1 FROM incidents i WHERE i.meter_id = o.offtaker_id AND i.confirmed = true) AS is_theft
-        FROM offtakers o ORDER BY o.offtaker_id
-    """)
+        FROM offtakers o {partner_filter} ORDER BY o.offtaker_id
+    """, params)
     return [CustomerListItem(customer_id=r["customer_id"], cluster_id=r["cluster_id"],
                               customer_type=r["customer_type"], is_theft_customer=bool(r["is_theft"]))
             for _, r in df.iterrows()]
@@ -314,27 +316,31 @@ def customer_detail(customer_id: str):
 
 
 @app.get("/api/theft/types", response_model=List[TheftTypeCount], dependencies=[Depends(require_api_key)])
-def theft_types():
+def theft_types(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+    partner_filter = "AND meter_id IN (SELECT offtaker_id FROM offtakers WHERE source_partner = %s)" if partner else ""
+    params = (partner,) if partner else ()
     df = query_df(
-        "SELECT incident_type AS theft_type, COUNT(*) AS count FROM incidents "
-        "WHERE confirmed = true GROUP BY incident_type ORDER BY count DESC"
+        f"SELECT incident_type AS theft_type, COUNT(*) AS count FROM incidents "
+        f"WHERE confirmed = true {partner_filter} GROUP BY incident_type ORDER BY count DESC", params
     )
     return [TheftTypeCount(theft_type=r["theft_type"], count=int(r["count"])) for _, r in df.iterrows()]
 
 
 @app.get("/api/theft/cases", response_model=List[TheftCase], dependencies=[Depends(require_api_key)])
-def theft_cases():
-    df = query_df("""
+def theft_cases(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+    partner_filter = "AND o.source_partner = %s" if partner else ""
+    params = (partner,) if partner else ()
+    df = query_df(f"""
         SELECT i.meter_id AS customer_id, o.cluster_id, o.customer_type,
                array_agg(DISTINCT i.incident_type) AS theft_types,
                COUNT(*) AS theft_days, SUM(i.kwh_stolen_est) AS kwh_stolen,
                MIN(i.incident_date) AS first_date, MAX(i.incident_date) AS last_date
         FROM incidents i
         JOIN offtakers o ON o.offtaker_id = i.meter_id
-        WHERE i.confirmed = true
+        WHERE i.confirmed = true {partner_filter}
         GROUP BY i.meter_id, o.cluster_id, o.customer_type
         ORDER BY kwh_stolen DESC
-    """)
+    """, params)
     return [TheftCase(
         customer_id=r["customer_id"], cluster_id=r["cluster_id"], customer_type=r["customer_type"],
         theft_types=sorted(r["theft_types"]), theft_days=int(r["theft_days"]),
@@ -380,7 +386,8 @@ def set_case_status(customer_id: str, body: CaseStatusUpdate):
 
 
 @app.get("/api/alerts", response_model=List[Alert], dependencies=[Depends(require_api_key)])
-def alerts(cluster_id: Optional[str] = Query(None), min_confidence: float = Query(0.0, ge=0.0, le=1.0)):
+def alerts(cluster_id: Optional[str] = Query(None), min_confidence: float = Query(0.0, ge=0.0, le=1.0),
+           partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
     """
     Scores real readings from the database through your trained model. Column
     names are aliased in SQL to match exactly what engineer_features() in
@@ -391,8 +398,16 @@ def alerts(cluster_id: Optional[str] = Query(None), min_confidence: float = Quer
     if not BUNDLE.loaded:
         raise HTTPException(status_code=503, detail="Model not loaded. Run train_model.py first.")
 
-    where_clause = "WHERE o.cluster_id = %s" if cluster_id else ""
-    params = (cluster_id,) if cluster_id else ()
+    conditions = []
+    params = []
+    if cluster_id:
+        conditions.append("o.cluster_id = %s")
+        params.append(cluster_id)
+    if partner:
+        conditions.append("o.source_partner = %s")
+        params.append(partner)
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params = tuple(params)
     df = query_df(f"""
         SELECT mr.meter_id AS customer_id, mr.reading_time::date AS date,
                mr.voltage, mr.current, mr.active_power_kw, mr.reactive_power_kvar,
