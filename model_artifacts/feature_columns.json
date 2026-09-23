@@ -1,0 +1,20 @@
+[
+  "voltage",
+  "current",
+  "active_power_kw",
+  "reactive_power_kvar",
+  "power_factor",
+  "tamper_flag",
+  "is_outage",
+  "kwh_recorded",
+  "expected_active_power_kw",
+  "power_residual",
+  "kwh_roll7_mean",
+  "kwh_roll7_std",
+  "kwh_deviation_from_baseline",
+  "pf_roll7_mean",
+  "pf_deviation_from_baseline",
+  "pf_deviation_from_cluster_peers",
+  "customer_type_enc",
+  "cluster_id_enc"
+]
