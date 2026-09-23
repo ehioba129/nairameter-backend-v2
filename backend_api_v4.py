@@ -63,20 +63,67 @@ app = FastAPI(title="NairaMeter API", description="Database-backed revenue-prote
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 # =====================================================================
-# API KEY PROTECTION — simple, effective gate for a solo-founder deployment.
-# Every request must include: X-API-Key: <your key> in its headers.
-# Set API_KEY as an environment variable (in Render, same place as DB_HOST etc).
-# If API_KEY isn't set, the API stays open (useful for local testing) — but
-# a WARNING prints at startup so you never forget it's unprotected.
+# API KEY PROTECTION — now scoped per-partner, not a single shared secret.
+#
+# Each key maps to a "scope": either None (full access — for your own
+# internal team) or a specific partner name (e.g. "cesel"), which HARD-LOCKS
+# that key to only ever see that partner's data — enforced here on the
+# server, not left to a client-side filter the user could simply change.
+# This closes a real gap: previously, any holder of the single shared key
+# could select "All Data" or another partner's name from the dashboard's
+# own dropdown and see everything, including data belonging to a different
+# partner than the one they were given access for.
+#
+# Configure via environment variables on Render:
+#   API_KEY            -> full access (your internal team)
+#   CESEL_API_KEY       -> locked to partner "cesel"
+#   HUSK_API_KEY        -> locked to partner "husk_power"
+# Add more PARTNERNAME_API_KEY variables the same way as you onboard
+# further partners — no code change needed, just a new env var plus one
+# line in PARTNER_KEY_ENV below.
 # =====================================================================
-API_KEY = os.environ.get("API_KEY")
+API_KEY = os.environ.get("API_KEY")  # kept for the startup warning below
+
+PARTNER_KEY_ENV = {
+    "cesel": "CESEL_API_KEY",
+    "husk_power": "HUSK_API_KEY",
+}
+
+def _build_key_scope_map():
+    """Builds {api_key_value: partner_scope_or_None} from environment variables."""
+    mapping = {}
+    if API_KEY:
+        mapping[API_KEY] = None  # None = unrestricted, full-access key
+    for partner, env_name in PARTNER_KEY_ENV.items():
+        partner_key = os.environ.get(env_name)
+        if partner_key:
+            mapping[partner_key] = partner
+    return mapping
+
+KEY_SCOPE_MAP = _build_key_scope_map()
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-def require_api_key(provided_key: str = Security(api_key_header)):
-    if API_KEY and provided_key != API_KEY:
+def require_api_key(provided_key: str = Security(api_key_header)) -> Optional[str]:
+    """
+    Returns the caller's enforced partner scope: None for a full-access key,
+    or a partner name (e.g. "cesel") for a partner-restricted key. Endpoints
+    use this returned scope to filter data — not whatever the client's own
+    query parameters ask for — so a restricted key can never see another
+    partner's data no matter what the frontend requests.
+    """
+    if KEY_SCOPE_MAP and provided_key not in KEY_SCOPE_MAP:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
-    return True
+    return KEY_SCOPE_MAP.get(provided_key)  # None if key-checking is disabled entirely
+
+
+def resolve_partner(requested_partner: Optional[str], enforced_scope: Optional[str]) -> Optional[str]:
+    """
+    The single rule every endpoint uses to decide which partner to filter by:
+    - A restricted key's scope always wins, regardless of what was requested.
+    - A full-access key may request any partner, or none (see everything).
+    """
+    return enforced_scope if enforced_scope else requested_partner
 
 
 def get_conn():
@@ -127,11 +174,12 @@ def load_model():
     if not DATABASE_URL:
         print("WARNING: DATABASE_URL is not set. All endpoints will fail until it's configured.")
 
-    if not API_KEY:
-        print("WARNING: API_KEY is not set — this API is currently PUBLIC with no protection. "
-              "Set the API_KEY environment variable to require X-API-Key on every request.")
+    if not KEY_SCOPE_MAP:
+        print("WARNING: no API keys are configured — this API is currently PUBLIC with no protection. "
+              "Set the API_KEY environment variable (and optional PARTNERNAME_API_KEY variables) to require X-API-Key on every request.")
     else:
-        print("API key protection is ACTIVE.")
+        n_partner_keys = sum(1 for v in KEY_SCOPE_MAP.values() if v is not None)
+        print(f"API key protection is ACTIVE — 1 full-access key, {n_partner_keys} partner-scoped key(s).")
 
 
 # =====================================================================
@@ -219,8 +267,10 @@ class Alert(BaseModel):
 # =====================================================================
 # ENDPOINTS — every one now a real SQL query against the live database
 # =====================================================================
-@app.get("/api/kpis", response_model=KPISummary, dependencies=[Depends(require_api_key)])
-def kpis(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+@app.get("/api/kpis", response_model=KPISummary)
+def kpis(partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys — their own scope always applies."),
+          enforced_scope: Optional[str] = Depends(require_api_key)):
+    partner = resolve_partner(partner, enforced_scope)
     partner_filter = "WHERE source_partner = %s" if partner else ""
     params = (partner,) if partner else ()
 
@@ -246,8 +296,10 @@ def kpis(partner: Optional[str] = Query(None, description="Filter to one data so
     )
 
 
-@app.get("/api/portfolio/timeseries", response_model=List[TimeseriesPoint], dependencies=[Depends(require_api_key)])
-def portfolio_timeseries(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+@app.get("/api/portfolio/timeseries", response_model=List[TimeseriesPoint])
+def portfolio_timeseries(partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys."),
+                          enforced_scope: Optional[str] = Depends(require_api_key)):
+    partner = resolve_partner(partner, enforced_scope)
     partner_filter = "WHERE meter_id IN (SELECT offtaker_id FROM offtakers WHERE source_partner = %s)" if partner else ""
     params = (partner,) if partner else ()
     df = query_df(
@@ -257,8 +309,10 @@ def portfolio_timeseries(partner: Optional[str] = Query(None, description="Filte
     return [TimeseriesPoint(date=r["date"], kwh_recorded=round(r["kwh_recorded"], 1)) for _, r in df.iterrows()]
 
 
-@app.get("/api/clusters/summary", response_model=List[ClusterSummaryRow], dependencies=[Depends(require_api_key)])
-def cluster_summary(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+@app.get("/api/clusters/summary", response_model=List[ClusterSummaryRow])
+def cluster_summary(partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys."),
+                     enforced_scope: Optional[str] = Depends(require_api_key)):
+    partner = resolve_partner(partner, enforced_scope)
     partner_filter = "WHERE o.source_partner = %s" if partner else ""
     params = (partner,) if partner else ()
     df = query_df(f"""
@@ -281,8 +335,10 @@ def cluster_summary(partner: Optional[str] = Query(None, description="Filter to 
     ) for _, r in df.iterrows()]
 
 
-@app.get("/api/customers", response_model=List[CustomerListItem], dependencies=[Depends(require_api_key)])
-def customer_list(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+@app.get("/api/customers", response_model=List[CustomerListItem])
+def customer_list(partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys."),
+                   enforced_scope: Optional[str] = Depends(require_api_key)):
+    partner = resolve_partner(partner, enforced_scope)
     partner_filter = "WHERE o.source_partner = %s" if partner else ""
     params = (partner,) if partner else ()
     df = query_df(f"""
@@ -295,8 +351,14 @@ def customer_list(partner: Optional[str] = Query(None, description="Filter to on
             for _, r in df.iterrows()]
 
 
-@app.get("/api/customers/{customer_id}/detail", response_model=List[CustomerDailyPoint], dependencies=[Depends(require_api_key)])
-def customer_detail(customer_id: str):
+@app.get("/api/customers/{customer_id}/detail", response_model=List[CustomerDailyPoint])
+def customer_detail(customer_id: str, enforced_scope: Optional[str] = Depends(require_api_key)):
+    if enforced_scope:
+        owner = query_df("SELECT source_partner FROM offtakers WHERE offtaker_id = %s", (customer_id,))
+        if owner.empty or owner.iloc[0]["source_partner"] != enforced_scope:
+            # 404, not 403 — a restricted key shouldn't learn that a customer
+            # ID exists at all if it belongs to a different partner.
+            raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found")
     df = query_df("""
         SELECT mr.reading_time::date AS date, mr.voltage, mr.current, mr.active_power_kw,
                mr.power_factor, mr.kwh_recorded, mr.tamper_status, mr.is_outage,
@@ -315,8 +377,10 @@ def customer_detail(customer_id: str):
     ) for _, r in df.iterrows()]
 
 
-@app.get("/api/theft/types", response_model=List[TheftTypeCount], dependencies=[Depends(require_api_key)])
-def theft_types(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+@app.get("/api/theft/types", response_model=List[TheftTypeCount])
+def theft_types(partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys."),
+                 enforced_scope: Optional[str] = Depends(require_api_key)):
+    partner = resolve_partner(partner, enforced_scope)
     partner_filter = "AND meter_id IN (SELECT offtaker_id FROM offtakers WHERE source_partner = %s)" if partner else ""
     params = (partner,) if partner else ()
     df = query_df(
@@ -326,8 +390,10 @@ def theft_types(partner: Optional[str] = Query(None, description="Filter to one 
     return [TheftTypeCount(theft_type=r["theft_type"], count=int(r["count"])) for _, r in df.iterrows()]
 
 
-@app.get("/api/theft/cases", response_model=List[TheftCase], dependencies=[Depends(require_api_key)])
-def theft_cases(partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+@app.get("/api/theft/cases", response_model=List[TheftCase])
+def theft_cases(partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys."),
+                 enforced_scope: Optional[str] = Depends(require_api_key)):
+    partner = resolve_partner(partner, enforced_scope)
     partner_filter = "AND o.source_partner = %s" if partner else ""
     params = (partner,) if partner else ()
     df = query_df(f"""
@@ -351,20 +417,22 @@ def theft_cases(partner: Optional[str] = Query(None, description="Filter to one 
 VALID_STATUSES = {"open", "investigating", "confirmed", "false_positive"}
 
 
-@app.get("/api/cases/status", response_model=List[CaseStatus], dependencies=[Depends(require_api_key)])
-def get_case_statuses():
+@app.get("/api/cases/status", response_model=List[CaseStatus])
+def get_case_statuses(enforced_scope: Optional[str] = Depends(require_api_key)):
     """
     Returns the current investigative status for every case that has one set.
     A customer with no row here is implicitly 'open' — the dashboard treats
     a missing entry as the default, so this only needs to return overrides.
     """
-    df = query_df("SELECT meter_id AS customer_id, status, updated_at::text FROM case_status")
+    partner_filter = "WHERE meter_id IN (SELECT offtaker_id FROM offtakers WHERE source_partner = %s)" if enforced_scope else ""
+    params = (enforced_scope,) if enforced_scope else ()
+    df = query_df(f"SELECT meter_id AS customer_id, status, updated_at::text FROM case_status {partner_filter}", params)
     return [CaseStatus(customer_id=r["customer_id"], status=r["status"], updated_at=r["updated_at"])
             for _, r in df.iterrows()]
 
 
-@app.put("/api/cases/{customer_id}/status", dependencies=[Depends(require_api_key)])
-def set_case_status(customer_id: str, body: CaseStatusUpdate):
+@app.put("/api/cases/{customer_id}/status")
+def set_case_status(customer_id: str, body: CaseStatusUpdate, enforced_scope: Optional[str] = Depends(require_api_key)):
     """
     Sets (upserts) the investigative status for one case. This is what makes
     status changes persistent and shared across every device/user, replacing
@@ -372,6 +440,11 @@ def set_case_status(customer_id: str, body: CaseStatusUpdate):
     """
     if body.status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(VALID_STATUSES)}")
+
+    if enforced_scope:
+        owner = query_df("SELECT source_partner FROM offtakers WHERE offtaker_id = %s", (customer_id,))
+        if owner.empty or owner.iloc[0]["source_partner"] != enforced_scope:
+            raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found")
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -385,9 +458,10 @@ def set_case_status(customer_id: str, body: CaseStatusUpdate):
 
 
 
-@app.get("/api/alerts", response_model=List[Alert], dependencies=[Depends(require_api_key)])
+@app.get("/api/alerts", response_model=List[Alert])
 def alerts(cluster_id: Optional[str] = Query(None), min_confidence: float = Query(0.0, ge=0.0, le=1.0),
-           partner: Optional[str] = Query(None, description="Filter to one data source, e.g. 'cesel'. Omit for all data.")):
+           partner: Optional[str] = Query(None, description="Ignored for partner-restricted keys."),
+           enforced_scope: Optional[str] = Depends(require_api_key)):
     """
     Scores real readings from the database through your trained model. Column
     names are aliased in SQL to match exactly what engineer_features() in
@@ -398,6 +472,7 @@ def alerts(cluster_id: Optional[str] = Query(None), min_confidence: float = Quer
     if not BUNDLE.loaded:
         raise HTTPException(status_code=503, detail="Model not loaded. Run train_model.py first.")
 
+    partner = resolve_partner(partner, enforced_scope)
     conditions = []
     params = []
     if cluster_id:
@@ -468,8 +543,8 @@ class AlertConfirmation(BaseModel):
     confirmed_by: Optional[str] = "dashboard_review"
 
 
-@app.post("/api/alerts/confirm", dependencies=[Depends(require_api_key)])
-def confirm_alert(body: AlertConfirmation):
+@app.post("/api/alerts/confirm")
+def confirm_alert(body: AlertConfirmation, enforced_scope: Optional[str] = Depends(require_api_key)):
     """
     Turns a model-generated alert into a real, permanent ground-truth record —
     this is THE feedback loop that lets NairaMeter's model keep improving.
@@ -481,6 +556,11 @@ def confirm_alert(body: AlertConfirmation):
                    "magnetic_interference", "partial_bypass", "reverse_current", "other"}
     if body.incident_type not in valid_types:
         raise HTTPException(status_code=400, detail=f"incident_type must be one of {sorted(valid_types)}")
+
+    if enforced_scope:
+        owner = query_df("SELECT source_partner FROM offtakers WHERE offtaker_id = %s", (body.customer_id,))
+        if owner.empty or owner.iloc[0]["source_partner"] != enforced_scope:
+            raise HTTPException(status_code=404, detail=f"Customer '{body.customer_id}' not found")
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -495,6 +575,16 @@ def confirm_alert(body: AlertConfirmation):
             """, (body.customer_id, body.incident_date, body.incident_type, body.confirmed_by))
         conn.commit()
     return {"customer_id": body.customer_id, "incident_date": body.incident_date, "status": "confirmed"}
+
+
+@app.get("/api/whoami")
+def whoami(enforced_scope: Optional[str] = Depends(require_api_key)):
+    """
+    Lets the dashboard know whether the current key is full-access or locked
+    to one partner, so it can hide the data-source selector entirely for a
+    restricted key rather than showing a choice that isn't really available.
+    """
+    return {"scope": enforced_scope}
 
 
 @app.get("/api/health")
