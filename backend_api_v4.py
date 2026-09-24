@@ -26,6 +26,7 @@ incidents loaded via migrate_incidents.py, and model_artifacts/ from train_model
 
 import json
 import os
+import math
 from urllib.parse import quote as urlquote
 from datetime import date
 from typing import List, Optional
@@ -217,11 +218,11 @@ class CustomerListItem(BaseModel):
 
 class CustomerDailyPoint(BaseModel):
     date: date
-    voltage: float
-    current: float
-    active_power_kw: float
-    power_factor: float
-    kwh_recorded: float
+    voltage: Optional[float] = None
+    current: Optional[float] = None
+    active_power_kw: Optional[float] = None
+    power_factor: Optional[float] = None
+    kwh_recorded: Optional[float] = None
     is_theft: int
     is_outage: int
     tamper_flag: int
@@ -370,9 +371,22 @@ def customer_detail(customer_id: str, enforced_scope: Optional[str] = Depends(re
     """, (customer_id,))
     if df.empty:
         raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found")
+    def nan_to_none(val):
+        """Pandas represents a database NULL as float NaN, not Python None.
+        NaN is technically still a valid float, so it slips past an Optional[float]
+        type check — but NaN cannot be represented in strict JSON (it serializes
+        as the bareword NaN, not null), which browsers correctly reject as invalid,
+        causing exactly the 'failed to load' error seen on real CESEL meters with
+        gaps in their data. Must convert to true None before returning."""
+        try:
+            return None if (val is None or math.isnan(val)) else val
+        except TypeError:
+            return val
+
     return [CustomerDailyPoint(
-        date=r["date"], voltage=r["voltage"], current=r["current"], active_power_kw=r["active_power_kw"],
-        power_factor=r["power_factor"], kwh_recorded=r["kwh_recorded"],
+        date=r["date"], voltage=nan_to_none(r["voltage"]), current=nan_to_none(r["current"]),
+        active_power_kw=nan_to_none(r["active_power_kw"]), power_factor=nan_to_none(r["power_factor"]),
+        kwh_recorded=nan_to_none(r["kwh_recorded"]),
         is_theft=int(r["is_theft"]), is_outage=int(r["is_outage"]), tamper_flag=int(r["tamper_status"]),
     ) for _, r in df.iterrows()]
 
