@@ -133,6 +133,23 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
+def safe_float(val, ndigits=None):
+    """
+    Converts a value that may be a pandas NaN (how a SQL NULL/empty SUM or
+    AVG surfaces after a database round-trip) into a genuine Python None.
+    A plain 'is not None' check does NOT catch this — NaN is not None, but
+    it is also not valid JSON, so it must be converted explicitly or the
+    response fails to parse in the browser. Use this anywhere a database
+    aggregate (SUM, AVG) might legitimately have no rows to aggregate.
+    """
+    try:
+        if val is None or math.isnan(val):
+            return None
+    except TypeError:
+        pass
+    return round(float(val), ndigits) if ndigits is not None else float(val)
+
+
 def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
     """Runs a query and returns a DataFrame — the simplest reliable bridge
     between psycopg2 and pandas for read-heavy endpoints like these."""
@@ -239,7 +256,7 @@ class TheftCase(BaseModel):
     customer_type: str
     theft_types: List[str]
     theft_days: int
-    kwh_stolen: float
+    kwh_stolen: Optional[float] = None
     first_date: date
     last_date: date
 
@@ -332,7 +349,7 @@ def cluster_summary(partner: Optional[str] = Query(None, description="Ignored fo
     return [ClusterSummaryRow(
         cluster_id=r["cluster_id"], n_customers=int(r["n_customers"]),
         incident_count=int(r["incident_count"]), customers_with_theft=int(r["customers_with_theft"]),
-        avg_power_factor=round(float(r["avg_power_factor"]), 3) if r["avg_power_factor"] is not None else 0.0,
+        avg_power_factor=safe_float(r["avg_power_factor"], 3) or 0.0,
     ) for _, r in df.iterrows()]
 
 
@@ -424,7 +441,7 @@ def theft_cases(partner: Optional[str] = Query(None, description="Ignored for pa
     return [TheftCase(
         customer_id=r["customer_id"], cluster_id=r["cluster_id"], customer_type=r["customer_type"],
         theft_types=sorted(r["theft_types"]), theft_days=int(r["theft_days"]),
-        kwh_stolen=round(float(r["kwh_stolen"]), 2), first_date=r["first_date"], last_date=r["last_date"],
+        kwh_stolen=safe_float(r["kwh_stolen"], 2), first_date=r["first_date"], last_date=r["last_date"],
     ) for _, r in df.iterrows()]
 
 
