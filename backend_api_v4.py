@@ -61,7 +61,7 @@ if not DATABASE_URL:
 MODEL_DIR = os.environ.get("NAIRAMETER_MODEL_DIR", "model_artifacts")
 
 app = FastAPI(title="NairaMeter API", description="Database-backed revenue-protection API.", version="4.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], allow_headers=["*"])
 
 # =====================================================================
 # API KEY PROTECTION — now scoped per-partner, not a single shared secret.
