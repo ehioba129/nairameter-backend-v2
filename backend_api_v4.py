@@ -608,6 +608,41 @@ def confirm_alert(body: AlertConfirmation, enforced_scope: Optional[str] = Depen
     return {"customer_id": body.customer_id, "incident_date": body.incident_date, "status": "confirmed"}
 
 
+class AlertUnconfirmation(BaseModel):
+    customer_id: str
+    incident_date: date
+    reason: Optional[str] = None
+
+
+@app.post("/api/alerts/unconfirm")
+def unconfirm_alert(body: AlertUnconfirmation, enforced_scope: Optional[str] = Depends(require_api_key)):
+    """
+    Reverses a mistaken confirmation — for when a case was confirmed as real
+    theft but further review shows that was wrong. Sets confirmed back to
+    false rather than deleting the record entirely, so there's still an
+    audit trail of what happened and why. This matters beyond just tidying
+    the dashboard: a wrongly-confirmed case would otherwise become a bad
+    label the next time the model is retrained, actively teaching it the
+    wrong thing rather than just cluttering a table.
+    """
+    if enforced_scope:
+        owner = query_df("SELECT source_partner FROM offtakers WHERE offtaker_id = %s", (body.customer_id,))
+        if owner.empty or owner.iloc[0]["source_partner"] != enforced_scope:
+            raise HTTPException(status_code=404, detail=f"Customer '{body.customer_id}' not found")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE incidents SET confirmed = false,
+                       notes = COALESCE(notes || E'\\n', '') || %s
+                WHERE meter_id = %s AND incident_date = %s;
+            """, (f"Reversed: {body.reason or 'marked not theft on review'}", body.customer_id, body.incident_date))
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="No confirmed incident found for that customer/date")
+        conn.commit()
+    return {"customer_id": body.customer_id, "incident_date": body.incident_date, "status": "unconfirmed"}
+
+
 @app.get("/api/whoami")
 def whoami(enforced_scope: Optional[str] = Depends(require_api_key)):
     """
