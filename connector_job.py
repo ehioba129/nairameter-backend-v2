@@ -45,7 +45,7 @@ from ingestion_service import run_ingestion
 
 PARTNER_SENDER_MAP = {
     # sender email address (lowercase) -> partner name used in the database
-    "data@cesel.example.com": "cesel",
+    "info@nairameter.com": "cesel",   # TEMPORARY test mapping — replace with CESEL's real sending address once known
     # "data@huskpowersystems.com": "husk_power",   # add future partners here
 }
 
